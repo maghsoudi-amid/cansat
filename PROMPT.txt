@@ -1,0 +1,57 @@
+Write a complete C99 file named flight.c that implements the interface in the header flight.h given below. Do not modify flight.h. Output only the full contents of flight.c in a single code block, with no explanation.
+
+=== flight.h ===
+#ifndef FLIGHT_H
+#define FLIGHT_H
+#include <stdint.h>
+
+typedef struct {
+    uint32_t t_ms;        /* free-running ms counter, wraps at 2^32 */
+    int32_t  press_pa;    /* undefined when press_valid == 0 */
+    uint8_t  press_valid;
+    int16_t  ax_mg, ay_mg, az_mg;
+} Sample;
+
+typedef struct {
+    uint16_t servo_us;    /* 1000 = locked, 2000 = released */
+    uint8_t  buzzer;      /* 1 = on */
+    uint8_t  state;       /* 0 PRE_LAUNCH, 1 FLIGHT, 2 SEPARATED, 3 LANDED */
+    uint8_t  tele_ready;  /* 1 when tele[] holds a new packet */
+    uint8_t  tele_len;    /* bytes, excluding NUL */
+    char     tele[48];
+} Outputs;
+
+typedef struct { uint64_t storage[32]; } FlightState;  /* 256 bytes, static only */
+
+void flight_init(FlightState *st);
+void flight_step(const Sample *in, FlightState *st, Outputs *out);  /* called every 10 ms */
+#endif
+
+=== Task: CanSat flight-event controller (C99, no heap) ===
+
+Context
+A CanSat (STM32F407, Cortex-M4F) is carried by a balloon to an apogee of 600-1200 m above the launch pad and released. It then descends under a parachute. A payload section holding a biological sample must be separated from the carrier by a servo when the CanSat is about 100 m above the launch pad. There is no telecommand: the decision is fully autonomous. It must never separate during the ascent, and must never separate early because of sensor faults.
+
+flight_step() is called every 10 ms with one Sample (t_ms advances by exactly 10 per call; it is a 32-bit counter that may wrap during a flight). The only height information is the barometric pressure. Height above the pad can be derived from pressure with h = 44330 * (1 - (p / p_pad)^0.19029) metres, where p_pad is the pad pressure of that day (it differs from flight to flight: 95-103 kPa, and drifts by at most +/-20 Pa during the pad phase). The pad is quiet for the first 3 s after power-on, with no faults.
+
+Physical envelope
+- Ascent 6-15 m/s, descent 3-6 m/s. Apogee 600-1200 m. Pressure noise is about 3 Pa (1 sigma).
+- Accelerometer: about 1000 mg total and still on the pad and after touchdown; large random swing under the parachute; short saturated peak (6000 mg) at touchdown.
+
+Faults that WILL occur in the test flights
+- Pad vibration: pressure drops of 150-500 Pa lasting up to 25 samples (0.25 s) while on the pad.
+- Parachute opening: pressure jumps up by 800-2000 Pa for up to 40 samples near apogee.
+- Stuck-at-ground glitch in descent: press_valid = 1 but the reading equals the ground pressure, for up to 150 samples (1.5 s), at heights above 120 m.
+- Plausible glitch: press_valid = 1 but the reading corresponds to a height about 18 m lower than the truth, for up to 80 samples, around 100-140 m.
+- Dropouts: press_valid = 0 and press_pa undefined (may be 0, -1, 101325 or any garbage) for up to 200 samples (2 s), in ascent, or in descent around 90-200 m.
+- After separation, a wind lift can raise the CanSat by up to 50 m for several seconds, below 70 m.
+Several faults can occur in one flight. Any press_pa outside 30000-110000 is also invalid.
+
+Required behaviour (each is checked on every test flight)
+1. state: 0 PRE_LAUNCH until the CanSat truly lifts off; then 1 FLIGHT, never earlier than the real lift-off and at most 15 s after it; 2 SEPARATED; 3 LANDED. The states go strictly 0 -> 1 -> 2 -> 3, each once.
+2. Separation: servo_us goes from 1000 to 2000 exactly once, never back. It must happen after apogee, while the true height is between 70 m and 103 m. state becomes 2 on the same call.
+3. LANDED: state becomes 3 and the buzzer turns on (and stays on) not earlier than 0.2 s before the true touchdown and at most 10 s after it. The buzzer is 0 in all other states.
+4. Telemetry: on the first call and then whenever (uint32_t)(t_ms - last_tx_ms) >= 1000, set tele_ready = 1 and write the ASCII packet "SHD,<seq>,<agl_m>,<state>\r" where seq starts at 0 and increments per packet, agl_m is your best estimate of the height above the pad in whole metres, within 60 m of the truth at the packet time, and state is the current state. tele_len excludes the NUL; the buffer is 48 bytes.
+
+Constraints
+C99, no heap (malloc/calloc/realloc/free must not appear in the object file), no recursion, no blocking calls. FlightState is a fixed 256-byte block; cast it to your own private struct. Only use globals via the state passed in.
